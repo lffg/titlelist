@@ -15,6 +15,12 @@ struct Args {
     /// Default is `%title <%url>`.
     #[arg(short, long)]
     template: Option<String>,
+
+    /// Doesn't emit links if the page doesn't have a title. By default, this
+    /// is set to `false` and if a page doesn't have a title, `@@@ NO TITLE @@@`
+    /// will be used.
+    #[arg(long, default_value = "false")]
+    skip_when_no_title: bool,
 }
 
 #[tokio::main]
@@ -32,12 +38,14 @@ async fn main() -> Result<()> {
     let mut urls_stream = stream::iter(titles_iter).buffered(10);
     while let Some(tup) = urls_stream.next().await {
         let (maybe_title, url) = tup?;
-        let title = maybe_title.as_deref().unwrap_or_else(|| {
+        let maybe_title = maybe_title.as_deref().or_else(|| {
             eprintln!("(no title for `{url}`)");
-            "@@@ NO TITLE @@@"
+            (!args.skip_when_no_title).then_some("@@@ NO TITLE @@@")
         });
-        let text = process_template(template, title, url);
-        println!("{text}");
+        if let Some(title) = maybe_title {
+            let text = process_template(template, title, url);
+            println!("{text}");
+        }
     }
 
     Ok(())
@@ -113,7 +121,10 @@ async fn parse_html_and_get_title(html: &str) -> Result<Option<String>> {
     let fragment = Html::parse_fragment(html);
 
     let mut elements = fragment.select(&SELECTOR);
-    let fst = elements.next().map(|el| join_text(el.text()));
+    let fst = elements
+        .next() // only get the first title tag
+        .map(|el| join_text(el.text())) // get full text from html text node
+        .filter(|title| !title.is_empty()); // map empty strings to none
 
     Ok(fst)
 }
