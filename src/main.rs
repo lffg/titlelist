@@ -1,14 +1,26 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    pin::pin,
+};
 
 use clap::Parser;
 use eyre::{Report, Result, WrapErr};
 use futures::{stream, StreamExt};
 use once_cell::sync::Lazy;
+use regex::{Captures, Regex};
+use reqwest::{Client, ClientBuilder};
+use scraper::{element_ref::Text, Html, Selector};
+use tokio::{
+    fs::File,
+    io::{stdin, AsyncReadExt},
+};
 
 #[derive(Parser)]
 struct Args {
-    /// Path of the file that contains the URLs, one per line.
-    path: PathBuf,
+    /// Path of the file that contains the URLs, one per line. Unless this
+    /// option is set, reads from the standard input.
+    #[arg(short, long)]
+    file: Option<PathBuf>,
 
     /// Template. Use `%title` and `%url` as placeholders.
     ///
@@ -29,13 +41,17 @@ async fn main() -> Result<()> {
 
     let template = args.template.as_deref().unwrap_or("%title <%url>");
 
-    let contents = load_file(&args.path).await?;
-    let titles_iter = get_urls(&contents).map(|url| async move {
-        let maybe_title = process_url(url).await?;
+    let contents = read_file_string(args.file.as_deref()).await?;
+
+    // Creates an iterator of futures.
+    let titles_iter = non_empty_lines(&contents).map(|url| async move {
+        let maybe_title = load_url_and_get_title(url).await?;
         Ok::<_, Report>((maybe_title, url))
     });
 
+    // Processes 10 futures concurrently.
     let mut urls_stream = stream::iter(titles_iter).buffered(10);
+
     while let Some(tup) = urls_stream.next().await {
         let (maybe_title, url) = tup?;
         let maybe_title = maybe_title.as_deref().or_else(|| {
@@ -51,9 +67,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Given a template, processes it by interpolating the given `title` and `url`
+/// strings. Expects to substitute `%title` and `%url` in the given template.
 fn process_template(template: &str, title: &str, url: &str) -> String {
-    use regex::{Captures, Regex};
-
     static RE: Lazy<Regex> = Lazy::new(|| Regex::new("%(title|url)").unwrap());
 
     let text = RE.replace_all(template, |cap: &Captures| match &cap[0] {
@@ -65,27 +81,38 @@ fn process_template(template: &str, title: &str, url: &str) -> String {
     text.into_owned()
 }
 
-async fn load_file(path: &Path) -> Result<String> {
-    tokio::fs::read_to_string(path)
-        .await
-        .wrap_err("failed to load file")
+/// Reads the contents of the given path, if it exists. Otherwise, reads from
+/// the standard input.
+async fn read_file_string(path: Option<&Path>) -> Result<String> {
+    async fn read(reader: impl AsyncReadExt) -> Result<String> {
+        let mut buf = String::new();
+        pin!(reader).read_to_string(&mut buf).await?;
+        Ok(buf)
+    }
+    match path {
+        Some(path) => read(File::open(path).await?).await,
+        None => read(stdin()).await,
+    }
 }
 
-fn get_urls(contents: &str) -> impl Iterator<Item = &str> {
+/// Returns an iterator over the non-empty lines of the provided string slice.
+fn non_empty_lines(contents: &str) -> impl Iterator<Item = &str> {
     contents
         .lines()
         .map(|line| line.trim())
         .filter(|line| !line.is_empty())
 }
 
-async fn process_url(url: &str) -> Result<Option<String>> {
+/// Fetches the content of the given URL and retrieves its page title, if it
+/// is present. If there is no title, `None` is returned.
+async fn load_url_and_get_title(url: &str) -> Result<Option<String>> {
     let html = load_html(url).await?;
     parse_html_and_get_title(&html).await
 }
 
+/// Fetches the given URL, returning the full page HTML as a string.
 async fn load_html(url: &str) -> Result<String> {
-    use reqwest::{Client, ClientBuilder};
-
+    // One doesn't really need this since one's only using the client once.
     static CLIENT: Lazy<Client> = Lazy::new(|| {
         ClientBuilder::new()
             .user_agent("load title tags")
@@ -103,11 +130,13 @@ async fn load_html(url: &str) -> Result<String> {
         .map_err(Into::into)
 }
 
+/// Parses the given HTML string and retrieves the text of the `title` tag,
+/// if it is present.
 async fn parse_html_and_get_title(html: &str) -> Result<Option<String>> {
-    use scraper::{element_ref::Text, Html, Selector};
-
     static SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("title").unwrap());
 
+    /// Produces a string by iterating over all text nodes. A space character is
+    /// inserted between two text nodes.
     fn join_text(text: Text<'_>) -> String {
         let mut s = String::new();
         for text_node in text {
@@ -122,9 +151,9 @@ async fn parse_html_and_get_title(html: &str) -> Result<Option<String>> {
 
     let mut elements = fragment.select(&SELECTOR);
     let fst = elements
-        .next() // only get the first title tag
-        .map(|el| join_text(el.text())) // get full text from html text node
-        .filter(|title| !title.is_empty()); // map empty strings to none
+        .next() // Only get the first title tag.
+        .map(|el| join_text(el.text())) // Get full text from html text node.
+        .filter(|title| !title.is_empty()); // Map empty strings to none.
 
     Ok(fst)
 }
